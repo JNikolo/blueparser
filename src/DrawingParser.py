@@ -108,6 +108,29 @@ class DrawingParser:
     def _extract_with_textract(self, pdf_path: str) -> Dict:
         """
         Extract text using AWS Textract
+        Automatically handles multi-page PDFs using async API
+        """
+        import boto3
+        from PyPDF2 import PdfReader
+        import time
+        from pathlib import Path
+        
+        # Check if PDF is multi-page
+        reader = PdfReader(pdf_path)
+        num_pages = len(reader.pages)
+        
+        print(f"PDF has {num_pages} page(s)")
+        
+        # For single-page PDFs, use synchronous API
+        if num_pages == 1:
+            return self._extract_with_textract_sync(pdf_path)
+        
+        # For multi-page PDFs, use asynchronous API with S3
+        return self._extract_with_textract_async(pdf_path)
+    
+    def _extract_with_textract_sync(self, pdf_path: str) -> Dict:
+        """
+        Extract text using AWS Textract synchronous API (single-page PDFs only)
         """
 
         import boto3
@@ -131,13 +154,122 @@ class DrawingParser:
                 FeatureTypes=['TABLES', 'FORMS']
             )
         except Exception as e:
-            print(f"Textract error: {e}")
+            print(f"Textract analyze_document error: {e}")
             # Fallback to detect_document_text if analyze fails
             response = textract.detect_document_text(
                 Document={'Bytes': doc_bytes}
             )
         
-        # Parse response
+        return self._parse_textract_response(response)
+    
+    def _extract_with_textract_async(self, pdf_path: str) -> Dict:
+        """
+        Extract text using AWS Textract asynchronous API (for multi-page PDFs)
+        Requires S3 bucket configuration
+        """
+        import boto3
+        import time
+        from pathlib import Path
+        
+        if not config.AWS_TEXTRACT_S3_BUCKET:
+            raise ValueError(
+                "AWS_TEXTRACT_S3_BUCKET environment variable not set. "
+                "Multi-page PDFs require S3 bucket for async processing. "
+                "Either set AWS_TEXTRACT_S3_BUCKET or use single-page PDFs."
+            )
+        
+        # Initialize AWS clients
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+            region_name=config.AWS_DEFAULT_REGION
+        )
+        
+        textract = boto3.client(
+            'textract',
+            aws_access_key_id=config.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
+            region_name=config.AWS_DEFAULT_REGION
+        )
+        
+        # Upload PDF to S3
+        s3_key = f"textract-input/{Path(pdf_path).name}"
+        print(f"Uploading to S3: s3://{config.AWS_TEXTRACT_S3_BUCKET}/{s3_key}")
+        
+        with open(pdf_path, 'rb') as doc_file:
+            s3.upload_fileobj(doc_file, config.AWS_TEXTRACT_S3_BUCKET, s3_key)
+        
+        # Start async document analysis
+        print("Starting Textract async analysis...")
+        response = textract.start_document_analysis(
+            DocumentLocation={
+                'S3Object': {
+                    'Bucket': config.AWS_TEXTRACT_S3_BUCKET,
+                    'Name': s3_key
+                }
+            },
+            FeatureTypes=['TABLES', 'FORMS']
+        )
+        
+        job_id = response['JobId']
+        print(f"Job ID: {job_id}")
+        print("Waiting for Textract to complete...")
+        
+        # Poll for completion
+        max_wait = 300  # 5 minutes max
+        wait_interval = 5  # Check every 5 seconds
+        elapsed = 0
+        
+        while elapsed < max_wait:
+            result = textract.get_document_analysis(JobId=job_id)
+            status = result['JobStatus']
+            
+            if status == 'SUCCEEDED':
+                print("✅ Textract analysis completed!")
+                
+                # Get all pages if there are multiple
+                all_blocks = result.get('Blocks', [])
+                next_token = result.get('NextToken')
+                
+                while next_token:
+                    result = textract.get_document_analysis(
+                        JobId=job_id,
+                        NextToken=next_token
+                    )
+                    all_blocks.extend(result.get('Blocks', []))
+                    next_token = result.get('NextToken')
+                
+                # Clean up S3 file
+                try:
+                    s3.delete_object(Bucket=config.AWS_TEXTRACT_S3_BUCKET, Key=s3_key)
+                    print(f"Cleaned up S3 file: {s3_key}")
+                except:
+                    pass
+                
+                return self._parse_textract_response({'Blocks': all_blocks})
+                
+            elif status == 'FAILED':
+                error_msg = result.get('StatusMessage', 'Unknown error')
+                # Clean up S3 file
+                try:
+                    s3.delete_object(Bucket=config.AWS_TEXTRACT_S3_BUCKET, Key=s3_key)
+                except:
+                    pass
+                raise Exception(f"Textract job failed: {error_msg}")
+            
+            # Still in progress
+            time.sleep(wait_interval)
+            elapsed += wait_interval
+            print(f"Status: {status} (waited {elapsed}s)")
+        
+        # Timeout
+        raise Exception(f"Textract job timed out after {max_wait} seconds")
+    
+    def _parse_textract_response(self, response: Dict) -> Dict:
+        """
+        Parse Textract response into standardized format
+        """
         blocks = response.get('Blocks', [])
         
         text_items = []
