@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import uuid
 from datetime import datetime
-from Config import Config
+from Config import config
 
 from DrawingParser import DrawingParser
 from DrawingValidator import DrawingValidator
@@ -19,7 +19,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=Config.ALLOWED_ORIGINS,
+    allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -279,8 +279,3 @@ async def health_check():
         },
         "timestamp": datetime.now().isoformat()
     }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
