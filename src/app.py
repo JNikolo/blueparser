@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import uuid
 from datetime import datetime
+from Config import Config
 
 from DrawingParser import DrawingParser
 from DrawingValidator import DrawingValidator
@@ -18,7 +19,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=Config.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
