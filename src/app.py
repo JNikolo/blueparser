@@ -1,9 +1,6 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
-import shutil
-import uuid
 from datetime import datetime
 from Config import config
 
@@ -29,20 +26,6 @@ app.add_middleware(
 parser = DrawingParser()
 validator = DrawingValidator()
 
-# Setup paths
-BASE_DIR = Path(__file__).parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
-
-
-def cleanup_file(file_path: Path):
-    """Background task to cleanup uploaded files"""
-    try:
-        if file_path.exists():
-            file_path.unlink()
-    except Exception as e:
-        print(f"Error cleaning up {file_path}: {e}")
-
 
 @app.get("/")
 async def root():
@@ -58,8 +41,7 @@ async def root():
 @app.post("/parse")
 async def parse_drawing(
     file: UploadFile = File(...),
-    ocr_method: str = "textract",
-    background_tasks: BackgroundTasks = BackgroundTasks()
+    ocr_method: str = "textract"
 ):
     """
     Parse an engineering drawing PDF and return results
@@ -75,20 +57,12 @@ async def parse_drawing(
     if ocr_method not in ['textract', 'vision']:
         raise HTTPException(status_code=400, detail="OCR method must be 'textract' or 'vision'")
     
-    # Generate unique filename for temporary storage
-    temp_filename = f"{uuid.uuid4()}_{file.filename}"
-    file_path = UPLOAD_DIR / temp_filename
-    
     try:
-        # Save uploaded file temporarily
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
-    
-    try:
-        # Parse the drawing
-        result = parser.parse(str(file_path), ocr_method=ocr_method)
+        # Read file content into memory
+        file_content = await file.read()
+        
+        # Parse the drawing using file content directly
+        result = parser.parse(file_content, ocr_method=ocr_method, filename=file.filename)
         
         # Validate the result
         validation = validator.validate(result)
@@ -96,14 +70,9 @@ async def parse_drawing(
         # Transform to LLM-friendly format
         llm_friendly_result = _transform_for_llm(result, validation, file.filename)
         
-        # Schedule cleanup of uploaded file
-        background_tasks.add_task(cleanup_file, file_path)
-        
         return JSONResponse(content=llm_friendly_result)
         
     except Exception as e:
-        # Cleanup on error
-        background_tasks.add_task(cleanup_file, file_path)
         raise HTTPException(status_code=500, detail=f"Parsing failed: {str(e)}")
 
 
@@ -273,9 +242,6 @@ async def health_check():
         "components": {
             "parser": "ready",
             "validator": "ready"
-        },
-        "storage": {
-            "upload_dir": str(UPLOAD_DIR)
         },
         "timestamp": datetime.now().isoformat()
     }

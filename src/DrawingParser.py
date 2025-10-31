@@ -6,9 +6,10 @@ from extractors.NotesExtractor import NotesExtractor
 from extractors.SpecificationExtractor import SpecificationExtractor
 from extractors.ReferenceExtractor import ReferenceExtractor
 from extractors.TableExtractor import TableExtractor
-from typing import List, Dict
+from typing import List, Dict, Union
 from DocTypeDetection import classify_drawing
 from Config import config
+from io import BytesIO
 
 
 class DrawingParser:
@@ -30,16 +31,21 @@ class DrawingParser:
             TableExtractor()
         ]
     
-    def parse(self, pdf_path: str, ocr_method: str = 'textract') -> Dict:
+    def parse(self, pdf_input: Union[str, bytes], ocr_method: str = 'textract', filename: str = None) -> Dict:
         """
         Main parsing method
+        
+        Args:
+            pdf_input: Either a file path (str) or file content (bytes)
+            ocr_method: 'textract' or 'vision'
+            filename: Optional filename for metadata (used when pdf_input is bytes)
         """
         # Step 1: OCR Extraction
         print(f"Extracting text using {ocr_method}...")
         if ocr_method == 'textract':
-            ocr_results = self._extract_with_textract(pdf_path)
+            ocr_results = self._extract_with_textract(pdf_input, filename or "document.pdf")
         else:
-            ocr_results = self._extract_with_vision(pdf_path)
+            ocr_results = self._extract_with_vision(pdf_input, filename or "document.pdf")
 
         text_items = ocr_results['text_items']
         full_text = ' '.join([item['text'] for item in text_items])
@@ -105,36 +111,52 @@ class DrawingParser:
         
         return zones
     
-    def _extract_with_textract(self, pdf_path: str) -> Dict:
+    def _extract_with_textract(self, pdf_input: Union[str, bytes], filename: str = "document.pdf") -> Dict:
         """
         Extract text using AWS Textract
         Automatically handles multi-page PDFs using async API
+        
+        Args:
+            pdf_input: Either a file path (str) or file content (bytes)
+            filename: Optional filename for S3 key (used for async processing)
         """
         import boto3
         from PyPDF2 import PdfReader
         import time
         from pathlib import Path
         
-        # Check if PDF is multi-page
-        reader = PdfReader(pdf_path)
+        # Get PDF bytes and check page count
+        if isinstance(pdf_input, bytes):
+            pdf_bytes = pdf_input
+            reader = PdfReader(BytesIO(pdf_bytes))
+        else:
+            # It's a file path
+            filename = Path(pdf_input).name  # Use actual filename from path
+            with open(pdf_input, 'rb') as f:
+                pdf_bytes = f.read()
+            reader = PdfReader(BytesIO(pdf_bytes))
+        
         num_pages = len(reader.pages)
         
         print(f"PDF has {num_pages} page(s)")
         
         # For single-page PDFs, use synchronous API
         if num_pages == 1:
-            return self._extract_with_textract_sync(pdf_path)
+            return self._extract_with_textract_sync(pdf_bytes)
         
         # For multi-page PDFs, use asynchronous API with S3
-        return self._extract_with_textract_async(pdf_path)
+        return self._extract_with_textract_async(pdf_bytes, filename)
+        return self._extract_with_textract_async(pdf_bytes)
     
-    def _extract_with_textract_sync(self, pdf_path: str) -> Dict:
+    def _extract_with_textract_sync(self, pdf_bytes: bytes) -> Dict:
         """
         Extract text using AWS Textract synchronous API (single-page PDFs only)
+        
+        Args:
+            pdf_bytes: PDF file content as bytes
         """
 
         import boto3
-        from typing import BinaryIO
         
         textract = boto3.client(
             'textract',
@@ -143,33 +165,33 @@ class DrawingParser:
             region_name=config.AWS_DEFAULT_REGION
         )
 
-        # Read PDF file
-        with open(pdf_path, 'rb') as doc_file:
-            doc_bytes = doc_file.read()
-        
-        # Call Textract
+        # Call Textract with bytes
         try:
             response = textract.analyze_document(
-                Document={'Bytes': doc_bytes},
+                Document={'Bytes': pdf_bytes},
                 FeatureTypes=['TABLES', 'FORMS']
             )
         except Exception as e:
             print(f"Textract analyze_document error: {e}")
             # Fallback to detect_document_text if analyze fails
             response = textract.detect_document_text(
-                Document={'Bytes': doc_bytes}
+                Document={'Bytes': pdf_bytes}
             )
         
         return self._parse_textract_response(response)
     
-    def _extract_with_textract_async(self, pdf_path: str) -> Dict:
+    def _extract_with_textract_async(self, pdf_bytes: bytes, filename: str = "document.pdf") -> Dict:
         """
         Extract text using AWS Textract asynchronous API (for multi-page PDFs)
         Requires S3 bucket configuration
+        
+        Args:
+            pdf_bytes: PDF file content as bytes
+            filename: Optional filename for S3 key
         """
         import boto3
         import time
-        from pathlib import Path
+        import uuid
         
         if not config.AWS_TEXTRACT_S3_BUCKET:
             raise ValueError(
@@ -193,12 +215,15 @@ class DrawingParser:
             region_name=config.AWS_DEFAULT_REGION
         )
         
-        # Upload PDF to S3
-        s3_key = f"textract-input/{Path(pdf_path).name}"
+        # Upload PDF to S3 with unique key
+        s3_key = f"textract-input/{uuid.uuid4()}_{filename}"
         print(f"Uploading to S3: s3://{config.AWS_TEXTRACT_S3_BUCKET}/{s3_key}")
         
-        with open(pdf_path, 'rb') as doc_file:
-            s3.upload_fileobj(doc_file, config.AWS_TEXTRACT_S3_BUCKET, s3_key)
+        s3.put_object(
+            Bucket=config.AWS_TEXTRACT_S3_BUCKET,
+            Key=s3_key,
+            Body=pdf_bytes
+        )
         
         # Start async document analysis
         print("Starting Textract async analysis...")
@@ -376,19 +401,27 @@ class DrawingParser:
             'column_count': len(table_data[0]) if table_data else 0
         }
     
-    def _extract_with_vision(self, pdf_path: str) -> Dict:
+    def _extract_with_vision(self, pdf_input: Union[str, bytes], filename: str = "document.pdf") -> Dict:
         """
         Extract text using Google Cloud Vision API
+        
+        Args:
+            pdf_input: Either a file path (str) or file content (bytes)
+            filename: Optional filename for temporary file naming
         """
         from google.cloud import vision
         import io
-        from pdf2image import convert_from_path
+        from pdf2image import convert_from_path, convert_from_bytes
         import tempfile
+        import os
         
         client = vision.ImageAnnotatorClient()
         
         # Convert PDF to images (Vision API works better with images)
-        images = convert_from_path(pdf_path, dpi=300)
+        if isinstance(pdf_input, bytes):
+            images = convert_from_bytes(pdf_input, dpi=300)
+        else:
+            images = convert_from_path(pdf_input, dpi=300)
         
         all_text_items = []
         page_num = 1
@@ -396,46 +429,54 @@ class DrawingParser:
         for image in images:
             # Save image to bytes
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_file:
-                image.save(temp_file.name, 'PNG')
-                
-                with io.open(temp_file.name, 'rb') as image_file:
+                temp_path = temp_file.name
+                image.save(temp_path, 'PNG')
+            
+            try:
+                with io.open(temp_path, 'rb') as image_file:
                     content = image_file.read()
-            
-            vision_image = vision.Image(content=content)
-            
-            # Perform text detection
-            response = client.document_text_detection(image=vision_image)
-            
-            if response.error.message:
-                raise Exception(f'Vision API error: {response.error.message}')
-            
-            # Parse response
-            for page in response.full_text_annotation.pages:
-                page_height = page.height
-                page_width = page.width
                 
-                for block in page.blocks:
-                    for paragraph in block.paragraphs:
-                        for word in paragraph.words:
-                            # Combine word symbols into text
-                            word_text = ''.join([
-                                symbol.text for symbol in word.symbols
-                            ])
-                            
-                            # Get bounding box (normalized)
-                            vertices = word.bounding_box.vertices
-                            
-                            all_text_items.append({
-                                'text': word_text,
-                                'confidence': word.confidence,
-                                'bbox': {
-                                    'left': vertices[0].x / page_width if page_width > 0 else 0,
-                                    'top': vertices[0].y / page_height if page_height > 0 else 0,
-                                    'width': (vertices[1].x - vertices[0].x) / page_width if page_width > 0 else 0,
-                                    'height': (vertices[2].y - vertices[0].y) / page_height if page_height > 0 else 0
-                                },
-                                'page': page_num
-                            })
+                vision_image = vision.Image(content=content)
+                
+                # Perform text detection
+                response = client.document_text_detection(image=vision_image)
+                
+                if response.error.message:
+                    raise Exception(f'Vision API error: {response.error.message}')
+                
+                # Parse response
+                for page in response.full_text_annotation.pages:
+                    page_height = page.height
+                    page_width = page.width
+                    
+                    for block in page.blocks:
+                        for paragraph in block.paragraphs:
+                            for word in paragraph.words:
+                                # Combine word symbols into text
+                                word_text = ''.join([
+                                    symbol.text for symbol in word.symbols
+                                ])
+                                
+                                # Get bounding box (normalized)
+                                vertices = word.bounding_box.vertices
+                                
+                                all_text_items.append({
+                                    'text': word_text,
+                                    'confidence': word.confidence,
+                                    'bbox': {
+                                        'left': vertices[0].x / page_width if page_width > 0 else 0,
+                                        'top': vertices[0].y / page_height if page_height > 0 else 0,
+                                        'width': (vertices[1].x - vertices[0].x) / page_width if page_width > 0 else 0,
+                                        'height': (vertices[2].y - vertices[0].y) / page_height if page_height > 0 else 0
+                                    },
+                                    'page': page_num
+                                })
+            finally:
+                # Clean up temporary image file
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
             
             page_num += 1
         
